@@ -1,3 +1,7 @@
+#
+#  Original code was ported from MXNET
+#
+#
 from __future__ import print_function
 from google.protobuf import text_format
 import argparse
@@ -5,7 +9,9 @@ import re
 import sys
 import pprint
 import math
+from os import *
 caffe_flag = True
+verbose = False
 
 try:
     import caffe
@@ -53,24 +59,28 @@ def convFlops(param, input_size, pre_group):
         stride = param.stride
     else:
         stride = 1 if len(param.stride) == 0 else param.stride[0]
+
     kernel_size = ''
     if isinstance(param.kernel_size, int):
         kernel_size = param.kernel_size
     else:
         kernel_size = param.kernel_size[0]
+
     dilate = 1
     if isinstance(param.dilation, int):
         dilate = param.dilation
     else:
         dilate = 1 if len(param.dilation) == 0 else param.dilation[0]
+
     if pre_group  != group:
         input_size[1] = input_size[1]  * pre_group
-    kernel_input_channel = input_size[1]/group
+        input_size[1] /= group
     # convert to string except for dilation
     param_string = "num_filter=%d, pad=(%d,%d), kernel=(%d,%d)," \
                    " stride=(%d,%d), no_bias=%s, num_intput_channel=%d, group=%d" %\
         (param.num_output, pad, pad, kernel_size,\
-        kernel_size, stride, stride, not param.bias_term, kernel_input_channel, group)
+        kernel_size, stride, stride, not param.bias_term, input_size[1], group)
+    if verbose :  print(param_string)
     # deal with dilation. Won't be in deconvolution
     if dilate > 1:
         param_string += ", dilate=(%d, %d)" % (dilate, dilate)
@@ -82,9 +92,12 @@ def convFlops(param, input_size, pre_group):
     output_size[1] = param.num_output / group
     output_size[2] = output_size[3] =  ( input_size[2] + 2 * pad  - kernel_size ) / stride + 1
     flops = 1.0 * output_size[2] * output_size[3] * \
-            ( 1 + kernel_size * kernel_size  * ( kernel_input_channel * 2 -1 ) )*\
+            ( kernel_size * kernel_size  * ( input_size[1] ) )*\
             output_size[1] * output_size[0]
-    return output_size, flops * group, group
+
+    weight =  ((kernel_size * kernel_size  * ( input_size[1] ) + 1) *  output_size[1] )
+    if verbose:   print(input_size, ":", kernel_size, input_size[1], output_size[1])
+    return output_size, flops * group, group, weight*group
 
 def proto2flops(proto_file):
     proto = readProtoSolverFile(proto_file)
@@ -101,7 +114,9 @@ def proto2flops(proto_file):
     else:
         raise Exception('Invalid proto file.')   
     # Get input size to network
-    input_dim = [10, 3, 224, 224] # default
+    input_dim = None
+    #input_dim = [10, 3, 224, 224] # default
+    #input_dim = [10, 3, 192, 192] # default
     #if len(proto.input_dim) > 0:
     #    input_dim = proto.input_dim
     #elif len(proto.input_shape) > 0: 
@@ -111,14 +126,15 @@ def proto2flops(proto_file):
     #pprint.pprint(layer[0])
     #input_name = layer[0].bottom[0]
     input_name = proto.name
-    print( "input_name is " + input_name )
-    print( "layer, type, input_size, output_size, flops")
+    if verbose:  print( "input_name is " + input_name )
+    if verbose:  print( "layer, type, input_size, output_size, flops")
     #input_name = "test"
     output_name = ""
     mapping = {input_name : 'data'}
     output_mapping = {}
     need_flatten = {input_name : False}
-    gflops = 0;
+    gflops = 0.0;
+    weight = 0.0;
     gpooling_flops = 0;
     pre_group = 1;
     conv_layer_num = 0;
@@ -137,19 +153,23 @@ def proto2flops(proto_file):
             output_mapping[name] = layer_output_size
         if layer[i].type == 'Input' :
             type_string = "mx.symbol.Input"
-            output_mapping[name] = layer[i].input_param.shape[0].dim
-            input_dim = layer[i].input_param.shape[0].dim
-            #pprint.pprint(output_mapping)
+            dim = layer[i].input_param.shape[0].dim
+            if input_dim != None:
+                dim = input_dim
+            if verbose:  print(type(dim))
+            output_mapping[name] = dim
+            input_dim = dim
             need_flatten[name] = False
         if layer[i].type == 'Convolution' or layer[i].type == 4:
             type_string = 'mx.symbol.Convolution'
             #print name,",",layer[i].type
-            layer_output_size, flop, pre_group = convFlops(layer[i].convolution_param, layer_input_size, pre_group)
+            layer_output_size, flop, pre_group, conv_weight = convFlops(layer[i].convolution_param, layer_input_size, pre_group)
             output_mapping[name] = layer_output_size
             conv_layer_num = conv_layer_num + 1
-            print( conv_layer_num,",",name, "=>", output_mapping[name])
-            gflops += flop;
-            print( name,",",layer[i].type ,",",layer_input_size,",", layer_output_size,",", flop,",",pre_group)
+            if verbose:  print( conv_layer_num,",",name, "=>", output_mapping[name])
+            gflops += flop
+            weight += conv_weight
+            if verbose:  print( name,",",layer[i].type ,",",layer_input_size,",", layer_output_size,",", flop,",",pre_group, ",", conv_weight)
 
             need_flatten[name] = True
         if layer[i].type == 'Deconvolution' or layer[i].type == 39:
@@ -203,13 +223,16 @@ def proto2flops(proto_file):
             layer_output_size[0] = layer_input_size[0]
             layer_output_size[1] = layer[i].inner_product_param.num_output
             layer_input_size[1] *= pre_group
+            fc_weight = layer_output_size[1] * ( layer_input_size[1] + 1)
+            weight += fc_weight
             #print layer_input_size
             if len(layer_input_size) == 4 :
-                flops  =  layer_output_size[0] * (layer_output_size[1] * layer_input_size[1] * layer_input_size[2]* layer_input_size[3] * 2  )
+                flops  =  layer_output_size[0] * (layer_output_size[1] * layer_input_size[1] * layer_input_size[2]* layer_input_size[3]  )
+                fc_weight = layer_output_size[1] * (layer_input_size[1] * layer_input_size[2]* layer_input_size[3] + 1)
             else:
-                flops  =  layer_output_size[0] * (layer_output_size[1] * layer_input_size[1] * 2  )
+                flops  =  layer_output_size[0] * (layer_output_size[1] * layer_input_size[1]  )
             pre_group = 1
-            print( name,",",layer[i].type ,",",layer_input_size,",", layer_output_size,",", flops)
+            if verbose:  print( name,",",layer[i].type ,",",layer_input_size,",", layer_output_size,",", flops, "," , fc_weight)
             gflops += flops
             output_mapping[name] = layer_output_size
             #print layer_output_size, flops
@@ -274,12 +297,15 @@ def proto2flops(proto_file):
         for j in range(len(layer[i].top)):
             mapping[layer[i].top[j]] = name
         output_name = name
-    return gflops /input_dim[0]
+    return input_name, gflops /input_dim[0], weight
 
 
 
 def main():
-    print( "total_conv_and_fc_flops in MillionMAD = " + str(proto2flops(sys.argv[1])/1e6/2))
+    os.listdir(sys.argv[1])
+    #name, mad, weight = proto2flops(sys.argv[1])
+    #if verbose: print( "total_conv_and_fc_flops in MillionMAD = %f, MillionParam = %f " % (mad/1e6, weight/1e6))
+    #print("%s,%f,%f " % (name, mad / 1e6, weight / 1e6))
 
 if __name__ == '__main__':
     main()
