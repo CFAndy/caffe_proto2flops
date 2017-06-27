@@ -9,7 +9,7 @@ import re
 import sys
 import pprint
 import math
-from os import *
+import os
 caffe_flag = True
 verbose = False
 
@@ -44,13 +44,19 @@ def dupInputSize(input_size):
     return output_size
 
 def convFlops(param, input_size, pre_group):
-    pad = 0
-    if isinstance(param.pad, int):
-        pad = param.pad
-    else:
-        pad = 0 if len(param.pad) == 0 else param.pad[0]
+    pad_h=pad_w = 0
 
-    group = 1 
+    if isinstance(param.pad, int):
+        pad_h = pad_w = param.pad
+    else:
+        if len(param.pad) > 0:
+            pad_h = pad_w = param.pad[0]
+        else :
+            if param.pad_h != 0:
+                pad_h = param.pad_h
+            if param.pad_w != 0:
+                pad_w = param.pad_w
+    group = 1
     if isinstance(param.group, int):
         group = param.group
 
@@ -60,11 +66,18 @@ def convFlops(param, input_size, pre_group):
     else:
         stride = 1 if len(param.stride) == 0 else param.stride[0]
 
-    kernel_size = ''
+    kernel_size_h = 0
+
     if isinstance(param.kernel_size, int):
-        kernel_size = param.kernel_size
+        #kernel_size = param.kernel_size
+        kernel_size_w = kernel_size_h = param.kernel_size
     else:
-        kernel_size = param.kernel_size[0]
+        if len(param.kernel_size) > 0:
+            kernel_size_h = kernel_size_w = param.kernel_size[0]
+        else:
+            kernel_size_h = param.kernel_h
+            kernel_size_w = param.kernel_w
+
 
     dilate = 1
     if isinstance(param.dilation, int):
@@ -78,8 +91,8 @@ def convFlops(param, input_size, pre_group):
     # convert to string except for dilation
     param_string = "num_filter=%d, pad=(%d,%d), kernel=(%d,%d)," \
                    " stride=(%d,%d), no_bias=%s, num_intput_channel=%d, group=%d" %\
-        (param.num_output, pad, pad, kernel_size,\
-        kernel_size, stride, stride, not param.bias_term, input_size[1], group)
+        (param.num_output, pad_h, pad_w, kernel_size_h, kernel_size_w,\
+         stride, stride, not param.bias_term, input_size[1], group)
     if verbose :  print(param_string)
     # deal with dilation. Won't be in deconvolution
     if dilate > 1:
@@ -90,13 +103,16 @@ def convFlops(param, input_size, pre_group):
     output_size[0] = input_size[0]
     #print pre_group, ",", param.group
     output_size[1] = param.num_output / group
-    output_size[2] = output_size[3] =  ( input_size[2] + 2 * pad  - kernel_size ) / stride + 1
+    output_size[2] =  ( input_size[2] + 2 * pad_h  - kernel_size_h ) / stride + 1
+    output_size[3] =  ( input_size[3] + 2 * pad_w  - kernel_size_w ) / stride + 1
     flops = 1.0 * output_size[2] * output_size[3] * \
-            ( kernel_size * kernel_size  * ( input_size[1] ) )*\
-            output_size[1] * output_size[0]
+            ( kernel_size_h * kernel_size_w  * ( input_size[1] ) )* output_size[1] * output_size[0]
+    #flops = 1.0 * output_size[2] * output_size[3] * \
+    #        ( kernel_size * kernel_size  * ( input_size[1] ) )*\
+    #        output_size[1] * output_size[0]
 
-    weight =  ((kernel_size * kernel_size  * ( input_size[1] ) + 1) *  output_size[1] )
-    if verbose:   print(input_size, ":", kernel_size, input_size[1], output_size[1])
+    weight =  ((kernel_size_h * kernel_size_w  * ( input_size[1] ) + 1) *  output_size[1] )
+    if verbose:   print(input_size, ":", kernel_size_h,kernel_size_w, input_size[1], output_size[1])
     return output_size, flops * group, group, weight*group
 
 def proto2flops(proto_file):
@@ -142,7 +158,7 @@ def proto2flops(proto_file):
         type_string = ''
         param_string = ''
         name = re.sub('[-/]', '_', layer[i].name)
-        #print name,",",layer[i].type
+        if verbose: print(name,",",layer[i].type)
 
         layer_output_size = [0,0,0,0]
         if i != 0 :
@@ -172,9 +188,9 @@ def proto2flops(proto_file):
             if verbose:  print( name,",",layer[i].type ,",",layer_input_size,",", layer_output_size,",", flop,",",pre_group, ",", conv_weight)
 
             need_flatten[name] = True
-        if layer[i].type == 'Deconvolution' or layer[i].type == 39:
+        if layer[i].type == 'Deconvolution' or layer[i].type == 39 or layer[i].type == 'Scale' or layer[i].type == 'Eltwise':
             type_string = 'mx.symbol.Deconvolution'
-            param_string = convFlops(layer[i].convolution_param)
+            #param_string = convFlops(layer[i].convolution_param)
             need_flatten[name] = True
         if layer[i].type == 'Pooling' or layer[i].type == 17:
             type_string = 'mx.symbol.Pooling'
@@ -302,10 +318,16 @@ def proto2flops(proto_file):
 
 
 def main():
-    os.listdir(sys.argv[1])
-    #name, mad, weight = proto2flops(sys.argv[1])
-    #if verbose: print( "total_conv_and_fc_flops in MillionMAD = %f, MillionParam = %f " % (mad/1e6, weight/1e6))
-    #print("%s,%f,%f " % (name, mad / 1e6, weight / 1e6))
+    model_dir = sys.argv[1]
+    files = os.listdir(model_dir)
+    for x in files:
+        if 'prototxt' in x :
+            from os import path
+            #print(x)
+            full_name = path.join(model_dir, x)
+            name, mad, weight = proto2flops(full_name)
+            #if verbose: print( "total_conv_and_fc_flops in MillionMAD = %f, MillionParam = %f " % (mad/1e6, weight/1e6))
+            print("%s, %s,%f,%f " % (x, name, mad / 1e6, weight / 1e6))
 
 if __name__ == '__main__':
     main()
