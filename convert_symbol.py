@@ -11,7 +11,7 @@ import pprint
 import math
 import os
 caffe_flag = True
-verbose = False
+verbose = True
 
 try:
     import caffe
@@ -328,6 +328,7 @@ def main():
             name, mad, weight = proto2flops(full_name)
             #if verbose: print( "total_conv_and_fc_flops in MillionMAD = %f, MillionParam = %f " % (mad/1e6, weight/1e6))
             print("%s, %s,%f,%f " % (x, name, mad / 1e6, weight / 1e6))
+
 
 if __name__ == '__main__':
     main()
